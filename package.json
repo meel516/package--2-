@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "@openai/agents": "^0.4.10",
+    "@types/fluent-ffmpeg": "^2.1.28",
+    "fluent-ffmpeg": "^2.1.3"
+  }
+}

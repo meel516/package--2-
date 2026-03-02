@@ -1,0 +1,10 @@
+node_modules
+dist
+temp
+final_output.mp4
+lambda.zip
+.env
+.env.*
+npm-debug.log*
+.git
+.gitignore
