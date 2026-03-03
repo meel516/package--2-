@@ -27,6 +27,10 @@ app.post("/add-music", async (req, res) => {
   sendResult(res, result);
 });
 
+app.get("/welcome", (_req, res) => {
+  res.status(200).type("html").send("<h1>Welcome to Saleems Blog</h1>");
+});
+
 app.get("/health", (_req, res) => {
   res.status(200).json({ok: true});
 });
