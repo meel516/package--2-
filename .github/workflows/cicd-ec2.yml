@@ -1,0 +1,95 @@
+name: CI/CD EC2
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: groq-agent
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: groq-agent/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript build
+        run: npm run build
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+
+      - name: Prepare runtime env file
+        env:
+          APP_ENV_FILE: ${{ secrets.APP_ENV_FILE }}
+        run: |
+          set -euo pipefail
+          printf "%s" "${APP_ENV_FILE}" > groq-agent/.env
+
+      - name: Sync repository to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_PORT: ${{ secrets.EC2_PORT }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_APP_DIR: ${{ secrets.EC2_APP_DIR }}
+        run: |
+          set -euo pipefail
+          rsync -az --delete \
+            --exclude ".git" \
+            --exclude "node_modules" \
+            -e "ssh -p ${EC2_PORT:-22} -o StrictHostKeyChecking=no" \
+            ./ "${EC2_USER}@${EC2_HOST}:${EC2_APP_DIR}/"
+
+      - name: Build and restart container on EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_PORT: ${{ secrets.EC2_PORT }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_APP_DIR: ${{ secrets.EC2_APP_DIR }}
+        run: |
+          set -euo pipefail
+          ssh -p "${EC2_PORT:-22}" -o StrictHostKeyChecking=no "${EC2_USER}@${EC2_HOST}" "EC2_APP_DIR='${EC2_APP_DIR}' bash -s" << 'EOF'
+            set -euo pipefail
+
+            APP_DIR="${EC2_APP_DIR}/groq-agent"
+            CONTAINER_NAME="groq-agent"
+            IMAGE_NAME="groq-agent:latest"
+
+            cd "${APP_DIR}"
+
+            docker build -f Dockerfile.ec2 -t "${IMAGE_NAME}" .
+            docker rm -f "${CONTAINER_NAME}" || true
+            docker run -d \
+              --name "${CONTAINER_NAME}" \
+              --restart unless-stopped \
+              -p 3003:3003 \
+              --env-file .env \
+              "${IMAGE_NAME}"
+
+            docker image prune -f
+          EOF
