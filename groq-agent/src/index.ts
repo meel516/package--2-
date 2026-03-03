@@ -137,9 +137,10 @@ async function handleAddMusic(payload: any): Promise<APIGatewayProxyStructuredRe
       return response(400, {error: "Invalid JSON body"});
     }
 
-    await materializeVideoInput(payload, inputPath);
+    const source = payload?.body && typeof payload.body === "object" ? payload.body : payload;
+    await materializeVideoInput(source, inputPath);
 
-    const selectedMusicKey = payload.musicKey || (await pickRandomMusicKey());
+    const selectedMusicKey = source.musicKey || (await pickRandomMusicKey());
     if (!selectedMusicKey) {
       return response(400, {
         error: "No background music found. Upload MP3 files under MUSIC_PREFIX in S3.",
@@ -346,8 +347,15 @@ async function runAddMusicFfmpeg(options: {
 }
 
 async function materializeVideoInput(payload: any, outPath: string): Promise<void> {
-  if (typeof payload.videoBase64 === "string" && payload.videoBase64.length > 0) {
-    const base64 = payload.videoBase64.includes(",") ? payload.videoBase64.split(",").pop()! : payload.videoBase64;
+  const directBase64 =
+    payload?.videoBase64 ||
+    payload?.video ||
+    payload?.base64Data ||
+    payload?.binaryData ||
+    payload?.data;
+
+  if (typeof directBase64 === "string" && directBase64.length > 0) {
+    const base64 = directBase64.includes(",") ? directBase64.split(",").pop()! : directBase64;
     fs.writeFileSync(outPath, Buffer.from(base64, "base64"));
     return;
   }
@@ -373,7 +381,9 @@ async function materializeVideoInput(payload: any, outPath: string): Promise<voi
     return;
   }
 
-  throw new Error("Provide one of: videoBase64, videoUrl, or videoKey");
+  throw new Error(
+    "Provide one of: videoBase64/video/base64Data/binaryData/data, videoUrl, or videoKey"
+  );
 }
 
 async function pickRandomMusicKey(): Promise<string | null> {
