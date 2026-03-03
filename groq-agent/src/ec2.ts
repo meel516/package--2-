@@ -1,9 +1,11 @@
 import express from "express";
+import multer from "multer";
 import {processApiRequest} from "./index";
 import type {APIGatewayProxyStructuredResultV2} from "aws-lambda";
 
 const app = express();
 const port = parseInt(process.env.PORT || "3003", 10);
+const upload = multer({storage: multer.memoryStorage()});
 
 app.use(express.json({limit: "50mb"}));
 
@@ -22,8 +24,16 @@ app.post("/upload-asset", async (req, res) => {
   sendResult(res, result);
 });
 
-app.post("/add-music", async (req, res) => {
-  const result = await processApiRequest("POST", "/add-music", req.body || {});
+app.post("/add-music", upload.single("video"), async (req, res) => {
+  const payload: Record<string, unknown> = {
+    ...(req.body || {}),
+  };
+
+  if (req.file?.buffer?.length) {
+    payload.videoBase64 = req.file.buffer.toString("base64");
+  }
+
+  const result = await processApiRequest("POST", "/add-music", payload);
   sendResult(res, result);
 });
 
