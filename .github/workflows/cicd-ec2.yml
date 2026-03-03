@@ -85,11 +85,11 @@ jobs:
             docker build -f Dockerfile.ec2 -t "${IMAGE_NAME}" .
             docker rm -f "${CONTAINER_NAME}" || true
             docker run -d \
-              --name "${CONTAINER_NAME}" \
-              --restart unless-stopped \
-              -p 3003:3003 \
-              --env-file .env \
-              "${IMAGE_NAME}"
+             --name "${CONTAINER_NAME}" \
+             --restart unless-stopped \
+             -p 80:3003 \
+             --env-file .env \
+             "${IMAGE_NAME}"
 
             docker image prune -f
           EOF
