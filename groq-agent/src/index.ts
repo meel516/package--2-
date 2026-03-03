@@ -156,7 +156,7 @@ async function handleAddMusic(payload: any): Promise<APIGatewayProxyStructuredRe
       outputPath,
       hasAudio: metadata.hasAudio,
     });
-
+//
     const outputKey = `${s3Prefix}/videos/${tempId}.mp4`;
     const outputBuffer = fs.readFileSync(outputPath);
 
