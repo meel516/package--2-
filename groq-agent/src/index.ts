@@ -156,9 +156,14 @@ async function handleAddMusic(payload: any): Promise<APIGatewayProxyStructuredRe
       outputPath,
       hasAudio: metadata.hasAudio,
     });
-//
-    const outputKey = `${s3Prefix}/videos/${tempId}.mp4`;
     const outputBuffer = fs.readFileSync(outputPath);
+    const outputMode = String(source.outputMode || payload?.outputMode || "").toLowerCase();
+
+    if (outputMode === "file" || outputMode === "direct") {
+      return binaryResponse("video/mp4", outputBuffer, `output-${tempId}.mp4`);
+    }
+
+    const outputKey = `${s3Prefix}/videos/${tempId}.mp4`;
 
     await s3.send(
       new PutObjectCommand({
@@ -506,5 +511,24 @@ function response(statusCode: number, body: Record<string, unknown>): APIGateway
       "Access-Control-Allow-Methods": "OPTIONS,POST",
     },
     body: JSON.stringify(body),
+  };
+}
+
+function binaryResponse(
+  contentType: string,
+  buffer: Buffer,
+  fileName: string
+): APIGatewayProxyStructuredResultV2 {
+  return {
+    statusCode: 200,
+    isBase64Encoded: true,
+    headers: {
+      "Content-Type": contentType,
+      "Content-Disposition": `attachment; filename=\"${fileName}\"`,
+      "Access-Control-Allow-Origin": allowedOrigin,
+      "Access-Control-Allow-Headers": "Content-Type,Authorization",
+      "Access-Control-Allow-Methods": "OPTIONS,POST",
+    },
+    body: buffer.toString("base64"),
   };
 }

@@ -31,6 +31,9 @@ app.post("/add-music", upload.single("video"), async (req, res) => {
 
   if (req.file?.buffer?.length) {
     payload.videoBase64 = req.file.buffer.toString("base64");
+    if (!payload.outputMode) {
+      payload.outputMode = "file";
+    }
   }
 
   const result = await processApiRequest("POST", "/add-music", payload);
@@ -57,6 +60,11 @@ function sendResult(res: express.Response, result: APIGatewayProxyStructuredResu
   }
 
   res.status(result.statusCode ?? 200);
+
+  if (result.body && (result as any).isBase64Encoded) {
+    res.send(Buffer.from(result.body, "base64"));
+    return;
+  }
 
   if (!result.body) {
     res.end();
