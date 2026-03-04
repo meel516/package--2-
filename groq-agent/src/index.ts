@@ -270,7 +270,7 @@ async function handleRemoveBackground(payload: any): Promise<APIGatewayProxyStru
   }
 
   const inputBuffer = Buffer.from(imageInput.base64, "base64");
-  const outputBuffer = await removeBackgroundFromImage(inputBuffer);
+  const outputBuffer = await removeBackgroundFromImage(inputBuffer, imageInput.mimeType);
   const outputKey = `${s3Prefix}/images/${Date.now()}-${crypto.randomBytes(4).toString("hex")}-nobg.png`;
 
   await s3.send(
@@ -555,16 +555,18 @@ async function bodyToBuffer(body: any): Promise<Buffer> {
   throw new Error("Unsupported S3 body stream type");
 }
 
-async function removeBackgroundFromImage(inputBuffer: Buffer): Promise<Buffer> {
+async function removeBackgroundFromImage(inputBuffer: Buffer, mimeType: string): Promise<Buffer> {
   const modelCandidates = Array.from(
     new Set([bgRemovalModelSize, "small", "medium"].filter((x) => x === "small" || x === "medium"))
   );
   const errors: string[] = [];
   let blob: Blob | null = null;
+  const normalizedMimeType = normalizeImageMimeType(mimeType);
+  const sourceBlob = new Blob([new Uint8Array(inputBuffer)], {type: normalizedMimeType});
 
   for (const model of modelCandidates) {
     try {
-      blob = (await removeBackgroundNode(inputBuffer, {
+      blob = (await removeBackgroundNode(sourceBlob, {
         model,
         output: {
           format: "image/png",
@@ -616,9 +618,22 @@ function parseBase64Data(raw: string, fallbackMimeType: string): {mimeType: stri
   }
 
   return {
-    mimeType: fallbackMimeType,
+    mimeType: normalizeImageMimeType(fallbackMimeType),
     base64: trimmed,
   };
+}
+
+function normalizeImageMimeType(mimeType: string): string {
+  const normalized = String(mimeType || "").split(";")[0].trim().toLowerCase();
+  if (normalized === "image/jpg") {
+    return "image/jpeg";
+  }
+
+  if (normalized === "image/jpeg" || normalized === "image/png" || normalized === "image/webp") {
+    return normalized;
+  }
+
+  return "application/octet-stream";
 }
 
 function buildS3Key(mimeType: string): string {
