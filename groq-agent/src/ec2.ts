@@ -15,6 +15,8 @@ const musicDirName = "music";
 void ensureDefaultRepoDirs();
 
 app.use(express.json({limit: "50mb"}));
+app.use("/assets", express.static(path.join(fileRoot, assetsDirName)));
+app.use("/music", express.static(path.join(fileRoot, musicDirName)));
 
 app.use(async (req, res, next) => {
   if (req.method !== "OPTIONS") {
@@ -411,6 +413,12 @@ const TOOLS_HTML = `<!doctype html>
       el.innerHTML = '<div class="error">' + message + '</div>';
     }
 
+    function buildPublicFileUrl(relativePath) {
+      const cleaned = String(relativePath || '').replace(/^\\/+/, '');
+      const encoded = cleaned.split('/').map(encodeURIComponent).join('/');
+      return getApiBase() + '/' + encoded;
+    }
+
     function showMessage(message, isError = false) {
       const out = document.getElementById('fileOut');
       out.innerHTML = isError ? '<div class="error">' + message + '</div>' : message;
@@ -469,6 +477,15 @@ const TOOLS_HTML = `<!doctype html>
           });
 
           actionCell.appendChild(openBtn);
+          if (item.type === 'file' && (item.path.startsWith('assets/') || item.path.startsWith('music/'))) {
+            const linkBtn = document.createElement('button');
+            linkBtn.textContent = 'Link';
+            linkBtn.addEventListener('click', () => {
+              const link = buildPublicFileUrl(item.path);
+              showMessage('Link: <a target="_blank" href="' + link + '">' + link + '</a>');
+            });
+            actionCell.appendChild(linkBtn);
+          }
           actionCell.appendChild(delBtn);
 
           tr.appendChild(nameCell);
