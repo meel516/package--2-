@@ -28,7 +28,8 @@ const s3Prefix = normalizePrefix(process.env.S3_PREFIX || "ai-generated-assets")
 const musicPrefix = normalizePrefix(process.env.MUSIC_PREFIX || "music");
 const signedUrlTtlSeconds = parseInt(process.env.SIGNED_URL_TTL_SECONDS || "3600", 10);
 const allowedOrigin = process.env.ALLOWED_ORIGIN || "*";
-const bgRemovalModel = process.env.BG_REMOVAL_MODEL || "Xenova/modnet";
+const bgRemovalModel = process.env.BG_REMOVAL_MODEL || "Xenova/detr-resnet-50-panoptic";
+let loadedBgRemovalModel = bgRemovalModel;
 
 let bgSegmenterPromise: Promise<any> | null = null;
 
@@ -296,7 +297,7 @@ async function handleRemoveBackground(payload: any): Promise<APIGatewayProxyStru
       signedUrl,
       mimeType: "image/png",
     },
-    model: bgRemovalModel,
+    model: loadedBgRemovalModel,
   });
 }
 
@@ -613,7 +614,23 @@ async function getBgSegmenter(): Promise<any> {
     bgSegmenterPromise = (async () => {
       const transformers = await import("@xenova/transformers");
       transformers.env.allowLocalModels = false;
-      return transformers.pipeline("image-segmentation", bgRemovalModel);
+
+      const candidates = Array.from(
+        new Set([bgRemovalModel, "Xenova/detr-resnet-50-panoptic"].filter(Boolean))
+      );
+      const errors: string[] = [];
+
+      for (const candidate of candidates) {
+        try {
+          const segmenter = await transformers.pipeline("image-segmentation", candidate);
+          loadedBgRemovalModel = candidate;
+          return segmenter;
+        } catch (error: any) {
+          errors.push(`${candidate}: ${error?.message || "unknown error"}`);
+        }
+      }
+
+      throw new Error(`Unable to load image-segmentation model. ${errors.join(" | ")}`);
     })();
   }
 
