@@ -63,6 +63,16 @@ app.post("/remove-bg", upload.any(), async (req, res) => {
   sendResult(res, result);
 });
 
+app.post("/remove-bg-asset", async (req, res) => {
+  const result = await processApiRequest("POST", "/remove-bg-asset", req.body || {});
+  sendResult(res, result);
+});
+
+app.post("/testing", async (req, res) => {
+  const result = await processApiRequest("POST", "/testing", req.body || {});
+  sendResult(res, result);
+});
+
 app.post("/add-music", upload.single("video"), async (req, res) => {
   const payload: Record<string, unknown> = {
     ...(req.body || {}),
@@ -357,6 +367,21 @@ const TOOLS_HTML = `<!doctype html>
     </div>
 
     <div class="card">
+      <h2>Testing (Base64)</h2>
+      <div class="grid">
+        <div>
+          <label for="testingImage">Choose Image</label>
+          <input id="testingImage" type="file" accept="image/*" />
+          <button id="testingBtn">Run /testing</button>
+        </div>
+        <div>
+          <div id="testingOut" class="out"></div>
+          <img id="testingPreview" alt="Testing preview" style="display:none;" />
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
       <h2>Repo File Manager</h2>
       <div class="mono">Current path: <span id="currentPath">.</span></div>
       <button id="upBtn">Go Up</button>
@@ -610,6 +635,40 @@ const TOOLS_HTML = `<!doctype html>
       }
     });
 
+    document.getElementById('testingBtn').addEventListener('click', async () => {
+      const out = document.getElementById('testingOut');
+      const preview = document.getElementById('testingPreview');
+      const fileInput = document.getElementById('testingImage');
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) {
+        renderError(out, 'Please choose an image file.');
+        return;
+      }
+
+      out.textContent = 'Running testing endpoint...';
+      preview.style.display = 'none';
+      try {
+        const b64 = await fileToBase64(file);
+        const res = await fetch(getApiBase() + '/testing', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ imageBase64: b64, mimeType: file.type || 'image/png' })
+        });
+        const data = await res.json();
+        if (!res.ok || !data.success) {
+          renderError(out, data.error || 'Testing failed');
+          return;
+        }
+
+        const dataUrl = 'data:image/png;base64,' + data.output.imageBase64;
+        out.innerHTML = 'Success. Base64 length: ' + data.output.imageBase64.length;
+        preview.src = dataUrl;
+        preview.style.display = 'block';
+      } catch (err) {
+        renderError(out, 'Testing failed: ' + (err.message || String(err)));
+      }
+    });
+
     document.getElementById('refreshBtn').addEventListener('click', () => listFiles(activePath));
     document.getElementById('upBtn').addEventListener('click', () => {
       if (activePath === '.') return listFiles('.');
@@ -685,6 +744,19 @@ const TOOLS_HTML = `<!doctype html>
       await deletePath(targetPath);
       await listFiles(activePath);
     });
+
+    function fileToBase64(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const raw = String(reader.result || '');
+          const value = raw.includes(',') ? raw.split(',').pop() : raw;
+          resolve(value);
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+    }
 
     listFiles('.');
   </script>

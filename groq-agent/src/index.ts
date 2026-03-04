@@ -4,6 +4,7 @@ import os from "os";
 import path from "path";
 import ffmpeg from "fluent-ffmpeg";
 import {removeBackground as removeBackgroundNode} from "@imgly/background-removal-node";
+import sharp from "sharp";
 import {
   GetObjectCommand,
   ListObjectsV2Command,
@@ -30,6 +31,8 @@ const signedUrlTtlSeconds = parseInt(process.env.SIGNED_URL_TTL_SECONDS || "3600
 const allowedOrigin = process.env.ALLOWED_ORIGIN || "*";
 const bgRemovalEngine = "@imgly/background-removal-node";
 const bgRemovalModelSize = (process.env.BG_REMOVAL_MODEL_SIZE || "small").toLowerCase();
+const rmbgModelId = "briaai/RMBG-1.4";
+let rmbgSegmenterPromise: Promise<any> | null = null;
 
 type UploadAsset = {
   mimeType: string;
@@ -60,6 +63,14 @@ export async function processApiRequest(
 
     if (route === "POST /upload-image") {
       return await handleUploadImage(payload);
+    }
+
+    if (route === "POST /remove-bg-asset") {
+      return await handleRemoveBackgroundAsset(payload);
+    }
+
+    if (route === "POST /testing") {
+      return await handleTesting(payload);
     }
 
     if (route === "POST /add-music") {
@@ -296,6 +307,85 @@ async function handleRemoveBackground(payload: any): Promise<APIGatewayProxyStru
       mimeType: "image/png",
     },
     model: bgRemovalEngine,
+  });
+}
+
+async function handleRemoveBackgroundAsset(payload: any): Promise<APIGatewayProxyStructuredResultV2> {
+  if (!payload || typeof payload !== "object") {
+    return response(400, {error: "Invalid JSON body"});
+  }
+
+  const source = payload?.body && typeof payload.body === "object" ? payload.body : payload;
+  const imageAssets = extractAssets(source).filter((asset) =>
+    String(asset.mimeType || "").toLowerCase().startsWith("image/")
+  );
+
+  if (imageAssets.length === 0) {
+    return response(400, {
+      error: "No image assets found. Provide assets[] or Gemini payload with image inlineData.",
+    });
+  }
+
+  const outputs = await Promise.all(
+    imageAssets.map(async (asset) => {
+      const inputBuffer = Buffer.from(asset.data, "base64");
+      const outputBuffer = await removeBackgroundWithRmbg(inputBuffer);
+      const key = `${s3Prefix}/images/${Date.now()}-${crypto.randomBytes(4).toString("hex")}-rmbg.png`;
+
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: key,
+          Body: outputBuffer,
+          ContentType: "image/png",
+        })
+      );
+
+      const signedUrl = await getSignedUrl(s3, new GetObjectCommand({Bucket: bucket, Key: key}), {
+        expiresIn: signedUrlTtlSeconds,
+      });
+
+      return {
+        key,
+        signedUrl,
+        mimeType: "image/png",
+      };
+    })
+  );
+
+  return response(200, {
+    success: true,
+    count: outputs.length,
+    outputs,
+    model: rmbgModelId,
+    engine: "@huggingface/transformers",
+  });
+}
+
+async function handleTesting(payload: any): Promise<APIGatewayProxyStructuredResultV2> {
+  if (!payload || typeof payload !== "object") {
+    return response(400, {error: "Invalid JSON body"});
+  }
+
+  const source = payload?.body && typeof payload.body === "object" ? payload.body : payload;
+  const imageInput = extractImagePayload(source);
+  if (!imageInput) {
+    return response(400, {
+      error: "Provide imageBase64/image/base64Data/data or assets[].",
+    });
+  }
+
+  const inputBuffer = Buffer.from(imageInput.base64, "base64");
+  const outputBuffer = await removeBackgroundWithRmbg(inputBuffer);
+
+  return response(200, {
+    success: true,
+    output: {
+      mimeType: "image/png",
+      imageBase64: outputBuffer.toString("base64"),
+    },
+    model: rmbgModelId,
+    engine: "@huggingface/transformers",
   });
 }
 
@@ -585,6 +675,70 @@ async function removeBackgroundFromImage(inputBuffer: Buffer, mimeType: string):
   }
 
   return Buffer.from(await blob.arrayBuffer());
+}
+
+async function removeBackgroundWithRmbg(inputBuffer: Buffer): Promise<Buffer> {
+  const tempInput = path.join(os.tmpdir(), `rmbg-input-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.png`);
+
+  try {
+    fs.writeFileSync(tempInput, inputBuffer);
+    const segmenter = await getRmbgSegmenter();
+    const segments = await segmenter(tempInput, {threshold: 0.5, mask_threshold: 0.5});
+
+    if (!Array.isArray(segments) || segments.length === 0) {
+      throw new Error("RMBG returned no mask");
+    }
+
+    const mask = segments[0]?.mask;
+    if (!mask?.data || !mask?.width || !mask?.height) {
+      throw new Error("Invalid RMBG mask output");
+    }
+
+    const base = sharp(inputBuffer).ensureAlpha();
+    const {data: rgba, info} = await base.raw().toBuffer({resolveWithObject: true});
+
+    let alpha = Buffer.from(mask.data);
+    if (mask.width !== info.width || mask.height !== info.height) {
+      alpha = await sharp(Buffer.from(mask.data), {
+        raw: {
+          width: mask.width,
+          height: mask.height,
+          channels: 1,
+        },
+      })
+        .resize(info.width, info.height, {fit: "fill"})
+        .raw()
+        .toBuffer();
+    }
+
+    for (let i = 0; i < info.width * info.height; i++) {
+      rgba[i * 4 + 3] = alpha[i];
+    }
+
+    return sharp(rgba, {
+      raw: {
+        width: info.width,
+        height: info.height,
+        channels: 4,
+      },
+    })
+      .png()
+      .toBuffer();
+  } finally {
+    safeDelete(tempInput);
+  }
+}
+
+async function getRmbgSegmenter(): Promise<any> {
+  if (!rmbgSegmenterPromise) {
+    rmbgSegmenterPromise = (async () => {
+      const transformers = await import("@huggingface/transformers");
+      transformers.env.allowLocalModels = false;
+      return transformers.pipeline("image-segmentation", rmbgModelId);
+    })();
+  }
+
+  return rmbgSegmenterPromise;
 }
 
 function extractImagePayload(payload: any): {mimeType: string; base64: string} | null {
