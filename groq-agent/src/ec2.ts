@@ -9,6 +9,10 @@ const app = express();
 const port = parseInt(process.env.PORT || "3003", 10);
 const upload = multer({storage: multer.memoryStorage()});
 const fileRoot = path.resolve(process.env.FILE_MANAGER_ROOT || process.cwd());
+const assetsDirName = "assets";
+const musicDirName = "music";
+
+void ensureDefaultRepoDirs();
 
 app.use(express.json({limit: "50mb"}));
 
@@ -284,6 +288,15 @@ function normalizeRelativePath(p: string): string {
   return p.split(path.sep).join("/");
 }
 
+async function ensureDefaultRepoDirs(): Promise<void> {
+  try {
+    await fs.mkdir(path.join(fileRoot, assetsDirName), {recursive: true});
+    await fs.mkdir(path.join(fileRoot, musicDirName), {recursive: true});
+  } catch (error) {
+    console.warn("Failed to create default repo directories", error);
+  }
+}
+
 const TOOLS_HTML = `<!doctype html>
 <html lang="en">
 <head>
@@ -346,6 +359,8 @@ const TOOLS_HTML = `<!doctype html>
       <div class="mono">Current path: <span id="currentPath">.</span></div>
       <button id="upBtn">Go Up</button>
       <button id="refreshBtn">Refresh</button>
+      <button id="assetsBtn">Open /assets</button>
+      <button id="musicBtn">Open /music</button>
       <table>
         <thead>
           <tr><th>Name</th><th>Type</th><th>Size</th><th>Modified</th><th>Action</th></tr>
@@ -366,7 +381,7 @@ const TOOLS_HTML = `<!doctype html>
           <label for="uploadFile">Upload File</label>
           <input id="uploadFile" type="file" />
           <label for="uploadDir">Upload Target Folder</label>
-          <input id="uploadDir" type="text" placeholder="example: src/assets" />
+          <input id="uploadDir" type="text" placeholder="example: assets or music" value="assets" />
           <button id="uploadFileBtn">Upload File To Repo</button>
         </div>
         <div>
@@ -585,6 +600,8 @@ const TOOLS_HTML = `<!doctype html>
       parts.pop();
       listFiles(parts.length ? parts.join('/') : '.');
     });
+    document.getElementById('assetsBtn').addEventListener('click', () => listFiles('assets'));
+    document.getElementById('musicBtn').addEventListener('click', () => listFiles('music'));
 
     document.getElementById('mkdirBtn').addEventListener('click', async () => {
       const folderPath = document.getElementById('newFolderPath').value.trim();
