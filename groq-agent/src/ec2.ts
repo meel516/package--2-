@@ -24,28 +24,30 @@ app.post("/upload-asset", async (req, res) => {
   sendResult(res, result);
 });
 
-app.post("/upload-image", upload.single("image"), async (req, res) => {
+app.post("/upload-image", upload.any(), async (req, res) => {
   const payload: Record<string, unknown> = {
     ...(req.body || {}),
   };
 
-  if (req.file?.buffer?.length) {
-    payload.imageBase64 = req.file.buffer.toString("base64");
-    payload.mimeType = req.file.mimetype || "image/png";
+  const file = firstUploadedFile(req);
+  if (file?.buffer?.length) {
+    payload.imageBase64 = file.buffer.toString("base64");
+    payload.mimeType = file.mimetype || "image/png";
   }
 
   const result = await processApiRequest("POST", "/upload-image", payload);
   sendResult(res, result);
 });
 
-app.post("/remove-bg", upload.single("image"), async (req, res) => {
+app.post("/remove-bg", upload.any(), async (req, res) => {
   const payload: Record<string, unknown> = {
     ...(req.body || {}),
   };
 
-  if (req.file?.buffer?.length) {
-    payload.imageBase64 = req.file.buffer.toString("base64");
-    payload.mimeType = req.file.mimetype || "image/png";
+  const file = firstUploadedFile(req);
+  if (file?.buffer?.length) {
+    payload.imageBase64 = file.buffer.toString("base64");
+    payload.mimeType = file.mimetype || "image/png";
   }
 
   const result = await processApiRequest("POST", "/remove-bg", payload);
@@ -108,6 +110,19 @@ function sendResult(res: express.Response, result: APIGatewayProxyStructuredResu
   } catch {
     res.send(result.body);
   }
+}
+
+function firstUploadedFile(req: express.Request): Express.Multer.File | null {
+  if (req.file) {
+    return req.file;
+  }
+
+  const files = req.files as Express.Multer.File[] | undefined;
+  if (Array.isArray(files) && files.length > 0) {
+    return files[0];
+  }
+
+  return null;
 }
 
 const TOOLS_HTML = `<!doctype html>
