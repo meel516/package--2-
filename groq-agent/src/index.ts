@@ -29,6 +29,7 @@ const musicPrefix = normalizePrefix(process.env.MUSIC_PREFIX || "music");
 const signedUrlTtlSeconds = parseInt(process.env.SIGNED_URL_TTL_SECONDS || "3600", 10);
 const allowedOrigin = process.env.ALLOWED_ORIGIN || "*";
 const bgRemovalEngine = "@imgly/background-removal-node";
+const bgRemovalModelSize = (process.env.BG_REMOVAL_MODEL_SIZE || "small").toLowerCase();
 
 type UploadAsset = {
   mimeType: string;
@@ -555,14 +556,31 @@ async function bodyToBuffer(body: any): Promise<Buffer> {
 }
 
 async function removeBackgroundFromImage(inputBuffer: Buffer): Promise<Buffer> {
-  const blob = await removeBackgroundNode(inputBuffer, {
-    model: "medium",
-    output: {
-      format: "image/png",
-      type: "foreground",
-      quality: 1,
-    },
-  } as any);
+  const modelCandidates = Array.from(
+    new Set([bgRemovalModelSize, "small", "medium"].filter((x) => x === "small" || x === "medium"))
+  );
+  const errors: string[] = [];
+  let blob: Blob | null = null;
+
+  for (const model of modelCandidates) {
+    try {
+      blob = (await removeBackgroundNode(inputBuffer, {
+        model,
+        output: {
+          format: "image/png",
+          type: "foreground",
+          quality: 1,
+        },
+      } as any)) as Blob;
+      break;
+    } catch (error: any) {
+      errors.push(`${model}: ${error?.message || "unknown error"}`);
+    }
+  }
+
+  if (!blob) {
+    throw new Error(`Background removal failed. ${errors.join(" | ")}`);
+  }
 
   return Buffer.from(await blob.arrayBuffer());
 }
