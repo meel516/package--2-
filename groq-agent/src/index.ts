@@ -3,6 +3,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import ffmpeg from "fluent-ffmpeg";
+import sharp from "sharp";
 import {
   GetObjectCommand,
   ListObjectsV2Command,
@@ -27,6 +28,9 @@ const s3Prefix = normalizePrefix(process.env.S3_PREFIX || "ai-generated-assets")
 const musicPrefix = normalizePrefix(process.env.MUSIC_PREFIX || "music");
 const signedUrlTtlSeconds = parseInt(process.env.SIGNED_URL_TTL_SECONDS || "3600", 10);
 const allowedOrigin = process.env.ALLOWED_ORIGIN || "*";
+const bgRemovalModel = process.env.BG_REMOVAL_MODEL || "Xenova/modnet";
+
+let bgSegmenterPromise: Promise<any> | null = null;
 
 type UploadAsset = {
   mimeType: string;
@@ -55,8 +59,16 @@ export async function processApiRequest(
       return await handleUploadAsset(payload);
     }
 
+    if (route === "POST /upload-image") {
+      return await handleUploadImage(payload);
+    }
+
     if (route === "POST /add-music") {
       return await handleAddMusic(payload);
+    }
+
+    if (route === "POST /remove-bg") {
+      return await handleRemoveBackground(payload);
     }
 
     return response(404, {error: `Route not found: ${route}`});
@@ -122,6 +134,54 @@ async function handleUploadAsset(payload: any): Promise<APIGatewayProxyStructure
     success: true,
     count: uploaded.length,
     assets: uploaded,
+  });
+}
+
+async function handleUploadImage(payload: any): Promise<APIGatewayProxyStructuredResultV2> {
+  if (!payload || typeof payload !== "object") {
+    return response(400, {error: "Invalid JSON body"});
+  }
+
+  const source = payload?.body && typeof payload.body === "object" ? payload.body : payload;
+  const imageInput = extractImagePayload(source);
+
+  if (!imageInput) {
+    return response(400, {
+      error: "Provide one image using imageBase64/image/base64Data/data or assets[].",
+    });
+  }
+
+  const mimeType = (imageInput.mimeType || "image/png").split(";")[0].toLowerCase();
+  if (!mimeType.startsWith("image/")) {
+    return response(400, {error: `Unsupported mimeType: ${mimeType}`});
+  }
+
+  const key = `${s3Prefix}/images/${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${extensionFromMimeType(
+    mimeType
+  )}`;
+  const buffer = Buffer.from(imageInput.base64, "base64");
+
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: buffer,
+      ContentType: mimeType,
+    })
+  );
+
+  const signedUrl = await getSignedUrl(s3, new GetObjectCommand({Bucket: bucket, Key: key}), {
+    expiresIn: signedUrlTtlSeconds,
+  });
+
+  return response(200, {
+    success: true,
+    output: {
+      key,
+      s3Uri: `s3://${bucket}/${key}`,
+      signedUrl,
+      mimeType,
+    },
   });
 }
 
@@ -194,6 +254,50 @@ async function handleAddMusic(payload: any): Promise<APIGatewayProxyStructuredRe
     safeDelete(musicPath);
     safeDelete(outputPath);
   }
+}
+
+async function handleRemoveBackground(payload: any): Promise<APIGatewayProxyStructuredResultV2> {
+  if (!payload || typeof payload !== "object") {
+    return response(400, {error: "Invalid JSON body"});
+  }
+
+  const source = payload?.body && typeof payload.body === "object" ? payload.body : payload;
+  const imageInput = extractImagePayload(source);
+
+  if (!imageInput) {
+    return response(400, {
+      error: "Provide one image using imageBase64/image/base64Data/data or assets[].",
+    });
+  }
+
+  const inputBuffer = Buffer.from(imageInput.base64, "base64");
+  const outputBuffer = await removeBackgroundFromImage(inputBuffer);
+  const outputKey = `${s3Prefix}/images/${Date.now()}-${crypto.randomBytes(4).toString("hex")}-nobg.png`;
+
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: outputKey,
+      Body: outputBuffer,
+      ContentType: "image/png",
+    })
+  );
+
+  const signedUrl = await getSignedUrl(
+    s3,
+    new GetObjectCommand({Bucket: bucket, Key: outputKey}),
+    {expiresIn: signedUrlTtlSeconds}
+  );
+
+  return response(200, {
+    success: true,
+    output: {
+      key: outputKey,
+      signedUrl,
+      mimeType: "image/png",
+    },
+    model: bgRemovalModel,
+  });
 }
 
 function parseJsonBody(event: APIGatewayProxyEventV2): any {
@@ -450,6 +554,140 @@ async function bodyToBuffer(body: any): Promise<Buffer> {
   }
 
   throw new Error("Unsupported S3 body stream type");
+}
+
+async function removeBackgroundFromImage(inputBuffer: Buffer): Promise<Buffer> {
+  const tempInput = path.join(os.tmpdir(), `remove-bg-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.png`);
+
+  try {
+    fs.writeFileSync(tempInput, inputBuffer);
+
+    const segmenter = await getBgSegmenter();
+    const segments = await segmenter(tempInput, {
+      threshold: 0.5,
+      mask_threshold: 0.5,
+    });
+
+    if (!Array.isArray(segments) || segments.length === 0) {
+      throw new Error("Segmentation returned no masks");
+    }
+
+    const {alpha, width: maskWidth, height: maskHeight} = mergeSegmentationMasks(segments);
+    const prepared = sharp(inputBuffer).ensureAlpha();
+    const {data: rgba, info} = await prepared.raw().toBuffer({resolveWithObject: true});
+
+    let resizedAlpha: Buffer = Buffer.from(alpha);
+    if (maskWidth !== info.width || maskHeight !== info.height) {
+      resizedAlpha = await sharp(Buffer.from(alpha), {
+        raw: {
+          width: maskWidth,
+          height: maskHeight,
+          channels: 1,
+        },
+      })
+        .resize(info.width, info.height, {fit: "fill"})
+        .raw()
+        .toBuffer();
+    }
+
+    for (let i = 0; i < info.width * info.height; i++) {
+      rgba[i * 4 + 3] = resizedAlpha[i];
+    }
+
+    return sharp(rgba, {
+      raw: {
+        width: info.width,
+        height: info.height,
+        channels: 4,
+      },
+    })
+      .png()
+      .toBuffer();
+  } finally {
+    safeDelete(tempInput);
+  }
+}
+
+async function getBgSegmenter(): Promise<any> {
+  if (!bgSegmenterPromise) {
+    bgSegmenterPromise = (async () => {
+      const transformers = await import("@xenova/transformers");
+      transformers.env.allowLocalModels = false;
+      return transformers.pipeline("image-segmentation", bgRemovalModel);
+    })();
+  }
+
+  return bgSegmenterPromise;
+}
+
+function mergeSegmentationMasks(segments: any[]): {alpha: Uint8Array; width: number; height: number} {
+  const nonBackground = segments.filter((segment) => {
+    const label = String(segment?.label || "").toLowerCase();
+    return !label.includes("background") && label !== "bg";
+  });
+
+  const selected = nonBackground.length > 0 ? nonBackground : segments;
+  const firstMask = selected[0]?.mask;
+  if (!firstMask?.data || !firstMask?.width || !firstMask?.height) {
+    throw new Error("Invalid segmentation mask output");
+  }
+
+  const width = firstMask.width;
+  const height = firstMask.height;
+  const alpha = new Uint8Array(width * height);
+
+  for (const segment of selected) {
+    const mask = segment?.mask;
+    if (!mask?.data || mask.width !== width || mask.height !== height) {
+      continue;
+    }
+
+    const channels = mask.channels || 1;
+    for (let i = 0; i < width * height; i++) {
+      const value = channels === 1 ? mask.data[i] : mask.data[i * channels];
+      if (value > alpha[i]) {
+        alpha[i] = value;
+      }
+    }
+  }
+
+  return {alpha, width, height};
+}
+
+function extractImagePayload(payload: any): {mimeType: string; base64: string} | null {
+  const direct = payload?.imageBase64 || payload?.image || payload?.base64Data || payload?.data;
+  if (typeof direct === "string" && direct.length > 0) {
+    return parseBase64Data(direct, payload?.mimeType || "image/png");
+  }
+
+  if (Array.isArray(payload?.assets)) {
+    const firstImage = payload.assets.find((asset: any) => {
+      const mimeType = String(asset?.mimeType || "").toLowerCase();
+      return mimeType.startsWith("image/") && (asset?.data || asset?.base64Data);
+    });
+
+    if (firstImage) {
+      return parseBase64Data(firstImage.data || firstImage.base64Data, firstImage.mimeType);
+    }
+  }
+
+  return null;
+}
+
+function parseBase64Data(raw: string, fallbackMimeType: string): {mimeType: string; base64: string} {
+  const trimmed = raw.trim();
+  const dataUrlMatch = trimmed.match(/^data:([^;]+);base64,(.+)$/i);
+  if (dataUrlMatch) {
+    return {
+      mimeType: dataUrlMatch[1],
+      base64: dataUrlMatch[2],
+    };
+  }
+
+  return {
+    mimeType: fallbackMimeType,
+    base64: trimmed,
+  };
 }
 
 function buildS3Key(mimeType: string): string {
