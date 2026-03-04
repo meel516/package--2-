@@ -59,11 +59,35 @@ jobs:
           EC2_APP_DIR: ${{ secrets.EC2_APP_DIR }}
         run: |
           set -euo pipefail
-          rsync -az --delete \
-            --exclude ".git" \
-            --exclude "node_modules" \
-            -e "ssh -p ${EC2_PORT:-22} -o StrictHostKeyChecking=no" \
-            ./ "${EC2_USER}@${EC2_HOST}:${EC2_APP_DIR}/"
+          SSH_OPTS="-p ${EC2_PORT:-22} -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -o ConnectTimeout=20"
+
+          for i in 1 2 3 4 5; do
+            if ssh ${SSH_OPTS} "${EC2_USER}@${EC2_HOST}" "echo ok" >/dev/null 2>&1; then
+              break
+            fi
+            echo "SSH preflight failed (attempt ${i}/5). Retrying..."
+            sleep 10
+            if [ "$i" -eq 5 ]; then
+              echo "SSH preflight failed after 5 attempts."
+              exit 1
+            fi
+          done
+
+          for i in 1 2 3 4 5; do
+            if rsync -az --delete \
+              --exclude ".git" \
+              --exclude "node_modules" \
+              -e "ssh ${SSH_OPTS}" \
+              ./ "${EC2_USER}@${EC2_HOST}:${EC2_APP_DIR}/"; then
+              break
+            fi
+            echo "rsync failed (attempt ${i}/5). Retrying..."
+            sleep 15
+            if [ "$i" -eq 5 ]; then
+              echo "rsync failed after 5 attempts."
+              exit 1
+            fi
+          done
 
       - name: Build and restart container on EC2
         env:
@@ -73,7 +97,10 @@ jobs:
           EC2_APP_DIR: ${{ secrets.EC2_APP_DIR }}
         run: |
           set -euo pipefail
-          ssh -p "${EC2_PORT:-22}" -o StrictHostKeyChecking=no "${EC2_USER}@${EC2_HOST}" "EC2_APP_DIR='${EC2_APP_DIR}' bash -s" << 'EOF'
+          SSH_OPTS="-p ${EC2_PORT:-22} -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -o ConnectTimeout=20"
+
+          for i in 1 2 3; do
+            if ssh ${SSH_OPTS} "${EC2_USER}@${EC2_HOST}" "EC2_APP_DIR='${EC2_APP_DIR}' bash -s" << 'EOF'
             set -euo pipefail
 
             APP_DIR="${EC2_APP_DIR}/groq-agent"
@@ -93,3 +120,13 @@ jobs:
 
             docker image prune -f
           EOF
+              then
+                break
+              fi
+              echo "Remote deploy command failed (attempt ${i}/3). Retrying..."
+              sleep 15
+              if [ "$i" -eq 3 ]; then
+                echo "Remote deploy command failed after 3 attempts."
+                exit 1
+              fi
+          done
