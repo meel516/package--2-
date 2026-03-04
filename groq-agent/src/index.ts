@@ -3,7 +3,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import ffmpeg from "fluent-ffmpeg";
-import sharp from "sharp";
+import {removeBackground as removeBackgroundNode} from "@imgly/background-removal-node";
 import {
   GetObjectCommand,
   ListObjectsV2Command,
@@ -28,10 +28,7 @@ const s3Prefix = normalizePrefix(process.env.S3_PREFIX || "ai-generated-assets")
 const musicPrefix = normalizePrefix(process.env.MUSIC_PREFIX || "music");
 const signedUrlTtlSeconds = parseInt(process.env.SIGNED_URL_TTL_SECONDS || "3600", 10);
 const allowedOrigin = process.env.ALLOWED_ORIGIN || "*";
-const bgRemovalModel = process.env.BG_REMOVAL_MODEL || "Xenova/detr-resnet-50-panoptic";
-let loadedBgRemovalModel = bgRemovalModel;
-
-let bgSegmenterPromise: Promise<any> | null = null;
+const bgRemovalEngine = "@imgly/background-removal-node";
 
 type UploadAsset = {
   mimeType: string;
@@ -297,7 +294,7 @@ async function handleRemoveBackground(payload: any): Promise<APIGatewayProxyStru
       signedUrl,
       mimeType: "image/png",
     },
-    model: loadedBgRemovalModel,
+    model: bgRemovalEngine,
   });
 }
 
@@ -558,117 +555,16 @@ async function bodyToBuffer(body: any): Promise<Buffer> {
 }
 
 async function removeBackgroundFromImage(inputBuffer: Buffer): Promise<Buffer> {
-  const tempInput = path.join(os.tmpdir(), `remove-bg-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.png`);
+  const blob = await removeBackgroundNode(inputBuffer, {
+    model: "medium",
+    output: {
+      format: "image/png",
+      type: "foreground",
+      quality: 1,
+    },
+  } as any);
 
-  try {
-    fs.writeFileSync(tempInput, inputBuffer);
-
-    const segmenter = await getBgSegmenter();
-    const segments = await segmenter(tempInput, {
-      threshold: 0.5,
-      mask_threshold: 0.5,
-    });
-
-    if (!Array.isArray(segments) || segments.length === 0) {
-      throw new Error("Segmentation returned no masks");
-    }
-
-    const {alpha, width: maskWidth, height: maskHeight} = mergeSegmentationMasks(segments);
-    const prepared = sharp(inputBuffer).ensureAlpha();
-    const {data: rgba, info} = await prepared.raw().toBuffer({resolveWithObject: true});
-
-    let resizedAlpha: Buffer = Buffer.from(alpha);
-    if (maskWidth !== info.width || maskHeight !== info.height) {
-      resizedAlpha = await sharp(Buffer.from(alpha), {
-        raw: {
-          width: maskWidth,
-          height: maskHeight,
-          channels: 1,
-        },
-      })
-        .resize(info.width, info.height, {fit: "fill"})
-        .raw()
-        .toBuffer();
-    }
-
-    for (let i = 0; i < info.width * info.height; i++) {
-      rgba[i * 4 + 3] = resizedAlpha[i];
-    }
-
-    return sharp(rgba, {
-      raw: {
-        width: info.width,
-        height: info.height,
-        channels: 4,
-      },
-    })
-      .png()
-      .toBuffer();
-  } finally {
-    safeDelete(tempInput);
-  }
-}
-
-async function getBgSegmenter(): Promise<any> {
-  if (!bgSegmenterPromise) {
-    bgSegmenterPromise = (async () => {
-      const transformers = await import("@xenova/transformers");
-      transformers.env.allowLocalModels = false;
-
-      const candidates = Array.from(
-        new Set([bgRemovalModel, "Xenova/detr-resnet-50-panoptic"].filter(Boolean))
-      );
-      const errors: string[] = [];
-
-      for (const candidate of candidates) {
-        try {
-          const segmenter = await transformers.pipeline("image-segmentation", candidate);
-          loadedBgRemovalModel = candidate;
-          return segmenter;
-        } catch (error: any) {
-          errors.push(`${candidate}: ${error?.message || "unknown error"}`);
-        }
-      }
-
-      throw new Error(`Unable to load image-segmentation model. ${errors.join(" | ")}`);
-    })();
-  }
-
-  return bgSegmenterPromise;
-}
-
-function mergeSegmentationMasks(segments: any[]): {alpha: Uint8Array; width: number; height: number} {
-  const nonBackground = segments.filter((segment) => {
-    const label = String(segment?.label || "").toLowerCase();
-    return !label.includes("background") && label !== "bg";
-  });
-
-  const selected = nonBackground.length > 0 ? nonBackground : segments;
-  const firstMask = selected[0]?.mask;
-  if (!firstMask?.data || !firstMask?.width || !firstMask?.height) {
-    throw new Error("Invalid segmentation mask output");
-  }
-
-  const width = firstMask.width;
-  const height = firstMask.height;
-  const alpha = new Uint8Array(width * height);
-
-  for (const segment of selected) {
-    const mask = segment?.mask;
-    if (!mask?.data || mask.width !== width || mask.height !== height) {
-      continue;
-    }
-
-    const channels = mask.channels || 1;
-    for (let i = 0; i < width * height; i++) {
-      const value = channels === 1 ? mask.data[i] : mask.data[i * channels];
-      if (value > alpha[i]) {
-        alpha[i] = value;
-      }
-    }
-  }
-
-  return {alpha, width, height};
+  return Buffer.from(await blob.arrayBuffer());
 }
 
 function extractImagePayload(payload: any): {mimeType: string; base64: string} | null {
