@@ -2,6 +2,8 @@ import crypto from "crypto";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import {Readable} from "stream";
+import {pipeline} from "stream/promises";
 import ffmpeg from "fluent-ffmpeg";
 import {removeBackground as removeBackgroundNode} from "@imgly/background-removal-node";
 import sharp from "sharp";
@@ -33,6 +35,12 @@ const bgRemovalEngine = "@imgly/background-removal-node";
 const bgRemovalModelSize = (process.env.BG_REMOVAL_MODEL_SIZE || "small").toLowerCase();
 const rmbgModelId = "briaai/RMBG-1.4";
 let rmbgSegmenterPromise: Promise<any> | null = null;
+const heavyJobConcurrency = Math.max(
+  1,
+  parseInt(process.env.HEAVY_JOB_CONCURRENCY || "2", 10) || 2
+);
+let activeHeavyJobs = 0;
+const heavyJobWaiters: Array<() => void> = [];
 
 type UploadAsset = {
   mimeType: string;
@@ -66,19 +74,19 @@ export async function processApiRequest(
     }
 
     if (route === "POST /remove-bg-asset") {
-      return await handleRemoveBackgroundAsset(payload);
+      return await withHeavyJobLimit(() => handleRemoveBackgroundAsset(payload));
     }
 
     if (route === "POST /testing") {
-      return await handleTesting(payload);
+      return await withHeavyJobLimit(() => handleTesting(payload));
     }
 
     if (route === "POST /add-music") {
-      return await handleAddMusic(payload);
+      return await withHeavyJobLimit(() => handleAddMusic(payload));
     }
 
     if (route === "POST /remove-bg") {
-      return await handleRemoveBackground(payload);
+      return await withHeavyJobLimit(() => handleRemoveBackground(payload));
     }
 
     return response(404, {error: `Route not found: ${route}`});
@@ -110,36 +118,35 @@ async function handleUploadAsset(payload: any): Promise<APIGatewayProxyStructure
     });
   }
 
-  const uploaded = await Promise.all(
-    assetsToProcess.map(async (asset) => {
-      const originalMime = asset.mimeType;
-      const rawBuffer = Buffer.from(asset.data, "base64");
+  const uploaded: Array<{key: string; mimeType: string; signedUrl: string}> = [];
+  for (const asset of assetsToProcess) {
+    const originalMime = asset.mimeType;
+    const rawBuffer = Buffer.from(asset.data, "base64");
 
-      const {buffer, mimeType} = await maybeConvertPcmToMp3(rawBuffer, originalMime);
-      const key = buildS3Key(mimeType);
+    const {buffer, mimeType} = await maybeConvertPcmToMp3(rawBuffer, originalMime);
+    const key = buildS3Key(mimeType);
 
-      await s3.send(
-        new PutObjectCommand({
-          Bucket: bucket,
-          Key: key,
-          Body: buffer,
-          ContentType: mimeType,
-        })
-      );
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: buffer,
+        ContentType: mimeType,
+      })
+    );
 
-      const signedUrl = await getSignedUrl(
-        s3,
-        new GetObjectCommand({Bucket: bucket, Key: key}),
-        {expiresIn: signedUrlTtlSeconds}
-      );
+    const signedUrl = await getSignedUrl(
+      s3,
+      new GetObjectCommand({Bucket: bucket, Key: key}),
+      {expiresIn: signedUrlTtlSeconds}
+    );
 
-      return {
-        key,
-        mimeType,
-        signedUrl,
-      };
-    })
-  );
+    uploaded.push({
+      key,
+      mimeType,
+      signedUrl,
+    });
+  }
 
   return response(200, {
     success: true,
@@ -170,7 +177,7 @@ async function handleUploadImage(payload: any): Promise<APIGatewayProxyStructure
   const key = `${s3Prefix}/images/${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${extensionFromMimeType(
     mimeType
   )}`;
-  const buffer = Buffer.from(imageInput.base64, "base64");
+  const buffer = imagePayloadToBuffer(imageInput);
 
   await s3.send(
     new PutObjectCommand({
@@ -227,10 +234,10 @@ async function handleAddMusic(payload: any): Promise<APIGatewayProxyStructuredRe
       outputPath,
       hasAudio: metadata.hasAudio,
     });
-    const outputBuffer = fs.readFileSync(outputPath);
     const outputMode = String(source.outputMode || payload?.outputMode || "").toLowerCase();
 
     if (outputMode === "file" || outputMode === "direct") {
+      const outputBuffer = fs.readFileSync(outputPath);
       return binaryResponse("video/mp4", outputBuffer, `output-${tempId}.mp4`);
     }
 
@@ -240,7 +247,7 @@ async function handleAddMusic(payload: any): Promise<APIGatewayProxyStructuredRe
       new PutObjectCommand({
         Bucket: bucket,
         Key: outputKey,
-        Body: outputBuffer,
+        Body: fs.createReadStream(outputPath),
         ContentType: "video/mp4",
       })
     );
@@ -281,7 +288,7 @@ async function handleRemoveBackground(payload: any): Promise<APIGatewayProxyStru
     });
   }
 
-  const inputBuffer = Buffer.from(imageInput.base64, "base64");
+  const inputBuffer = imagePayloadToBuffer(imageInput);
   const outputBuffer = await removeBackgroundFromImage(inputBuffer, imageInput.mimeType);
   const outputKey = `${s3Prefix}/images/${Date.now()}-${crypto.randomBytes(4).toString("hex")}-nobg.png`;
 
@@ -327,32 +334,31 @@ async function handleRemoveBackgroundAsset(payload: any): Promise<APIGatewayProx
     });
   }
 
-  const outputs = await Promise.all(
-    imageAssets.map(async (asset) => {
-      const inputBuffer = Buffer.from(asset.data, "base64");
-      const outputBuffer = await removeBackgroundWithRmbg(inputBuffer);
-      const key = `${s3Prefix}/images/${Date.now()}-${crypto.randomBytes(4).toString("hex")}-rmbg.png`;
+  const outputs: Array<{key: string; signedUrl: string; mimeType: string}> = [];
+  for (const asset of imageAssets) {
+    const inputBuffer = Buffer.from(asset.data, "base64");
+    const outputBuffer = await removeBackgroundWithRmbg(inputBuffer);
+    const key = `${s3Prefix}/images/${Date.now()}-${crypto.randomBytes(4).toString("hex")}-rmbg.png`;
 
-      await s3.send(
-        new PutObjectCommand({
-          Bucket: bucket,
-          Key: key,
-          Body: outputBuffer,
-          ContentType: "image/png",
-        })
-      );
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: outputBuffer,
+        ContentType: "image/png",
+      })
+    );
 
-      const signedUrl = await getSignedUrl(s3, new GetObjectCommand({Bucket: bucket, Key: key}), {
-        expiresIn: signedUrlTtlSeconds,
-      });
+    const signedUrl = await getSignedUrl(s3, new GetObjectCommand({Bucket: bucket, Key: key}), {
+      expiresIn: signedUrlTtlSeconds,
+    });
 
-      return {
-        key,
-        signedUrl,
-        mimeType: "image/png",
-      };
-    })
-  );
+    outputs.push({
+      key,
+      signedUrl,
+      mimeType: "image/png",
+    });
+  }
 
   return response(200, {
     success: true,
@@ -376,7 +382,7 @@ async function handleTesting(payload: any): Promise<APIGatewayProxyStructuredRes
     });
   }
 
-  const inputBuffer = Buffer.from(imageInput.base64, "base64");
+  const inputBuffer = imagePayloadToBuffer(imageInput);
   const outputBuffer = await removeBackgroundWithRmbg(inputBuffer);
 
   return response(200, {
@@ -546,6 +552,11 @@ async function runAddMusicFfmpeg(options: {
 }
 
 async function materializeVideoInput(payload: any, outPath: string): Promise<void> {
+  if (Buffer.isBuffer(payload?.videoBuffer)) {
+    fs.writeFileSync(outPath, payload.videoBuffer);
+    return;
+  }
+
   const directBase64 =
     payload?.videoBase64 ||
     payload?.video ||
@@ -555,7 +566,7 @@ async function materializeVideoInput(payload: any, outPath: string): Promise<voi
 
   if (typeof directBase64 === "string" && directBase64.length > 0) {
     const base64 = directBase64.includes(",") ? directBase64.split(",").pop()! : directBase64;
-    fs.writeFileSync(outPath, Buffer.from(base64, "base64"));
+    fs.writeFileSync(outPath, base64, {encoding: "base64"});
     return;
   }
 
@@ -570,8 +581,12 @@ async function materializeVideoInput(payload: any, outPath: string): Promise<voi
     if (!response.ok) {
       throw new Error(`Failed to download videoUrl: ${response.status} ${response.statusText}`);
     }
-    const data = Buffer.from(await response.arrayBuffer());
-    fs.writeFileSync(outPath, data);
+
+    if (!response.body) {
+      throw new Error("Failed to download videoUrl: missing response body");
+    }
+
+    await pipeline(Readable.fromWeb(response.body as any), fs.createWriteStream(outPath));
     return;
   }
 
@@ -617,7 +632,44 @@ async function downloadS3ObjectToFile(
     })
   );
 
-  const data = await bodyToBuffer(object.Body);
+  await writeBodyToFile(object.Body, outPath);
+}
+
+async function writeBodyToFile(body: any, outPath: string): Promise<void> {
+  if (!body) {
+    fs.writeFileSync(outPath, Buffer.alloc(0));
+    return;
+  }
+
+  if (typeof body.pipe === "function") {
+    await pipeline(body, fs.createWriteStream(outPath));
+    return;
+  }
+
+  if (typeof body[Symbol.asyncIterator] === "function") {
+    const writable = fs.createWriteStream(outPath);
+    try {
+      for await (const chunk of body) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        if (!writable.write(buffer)) {
+          await new Promise<void>((resolve, reject) => {
+            writable.once("drain", resolve);
+            writable.once("error", reject);
+          });
+        }
+      }
+      await new Promise<void>((resolve, reject) => {
+        writable.end(() => resolve());
+        writable.once("error", reject);
+      });
+    } catch (error) {
+      writable.destroy();
+      throw error;
+    }
+    return;
+  }
+
+  const data = await bodyToBuffer(body);
   fs.writeFileSync(outPath, data);
 }
 
@@ -742,7 +794,14 @@ async function getRmbgSegmenter(): Promise<any> {
   return rmbgSegmenterPromise;
 }
 
-function extractImagePayload(payload: any): {mimeType: string; base64: string} | null {
+function extractImagePayload(payload: any): {mimeType: string; base64?: string; buffer?: Buffer} | null {
+  if (Buffer.isBuffer(payload?.imageBuffer)) {
+    return {
+      mimeType: normalizeImageMimeType(payload?.mimeType || "image/png"),
+      buffer: payload.imageBuffer,
+    };
+  }
+
   const direct = payload?.imageBase64 || payload?.image || payload?.base64Data || payload?.data;
   if (typeof direct === "string" && direct.length > 0) {
     return parseBase64Data(direct, payload?.mimeType || "image/png");
@@ -760,6 +819,13 @@ function extractImagePayload(payload: any): {mimeType: string; base64: string} |
   }
 
   return null;
+}
+
+function imagePayloadToBuffer(input: {mimeType: string; base64?: string; buffer?: Buffer}): Buffer {
+  if (input.buffer) {
+    return input.buffer;
+  }
+  return Buffer.from(input.base64 || "", "base64");
 }
 
 function parseBase64Data(raw: string, fallbackMimeType: string): {mimeType: string; base64: string} {
@@ -837,6 +903,37 @@ function safeDelete(filePath: string): void {
     }
   } catch (error) {
     console.warn(`Failed to delete temp file ${filePath}`, error);
+  }
+}
+
+async function withHeavyJobLimit<T>(work: () => Promise<T>): Promise<T> {
+  await acquireHeavyJobSlot();
+  try {
+    return await work();
+  } finally {
+    releaseHeavyJobSlot();
+  }
+}
+
+async function acquireHeavyJobSlot(): Promise<void> {
+  if (activeHeavyJobs < heavyJobConcurrency) {
+    activeHeavyJobs += 1;
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    heavyJobWaiters.push(() => {
+      activeHeavyJobs += 1;
+      resolve();
+    });
+  });
+}
+
+function releaseHeavyJobSlot(): void {
+  activeHeavyJobs = Math.max(0, activeHeavyJobs - 1);
+  const next = heavyJobWaiters.shift();
+  if (next) {
+    next();
   }
 }
 

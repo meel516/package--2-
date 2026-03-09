@@ -40,7 +40,7 @@ app.post("/upload-image", upload.any(), async (req, res) => {
 
   const file = firstUploadedFile(req);
   if (file?.buffer?.length) {
-    payload.imageBase64 = file.buffer.toString("base64");
+    payload.imageBuffer = file.buffer;
     payload.mimeType = file.mimetype || "image/png";
   }
 
@@ -55,7 +55,7 @@ app.post("/remove-bg", upload.any(), async (req, res) => {
 
   const file = firstUploadedFile(req);
   if (file?.buffer?.length) {
-    payload.imageBase64 = file.buffer.toString("base64");
+    payload.imageBuffer = file.buffer;
     payload.mimeType = file.mimetype || "image/png";
   }
 
@@ -79,7 +79,7 @@ app.post("/add-music", upload.single("video"), async (req, res) => {
   };
 
   if (req.file?.buffer?.length) {
-    payload.videoBase64 = req.file.buffer.toString("base64");
+    payload.videoBuffer = req.file.buffer;
     if (!payload.outputMode) {
       payload.outputMode = "file";
     }
