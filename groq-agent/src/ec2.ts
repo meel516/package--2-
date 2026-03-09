@@ -2,7 +2,7 @@ import express from "express";
 import multer from "multer";
 import fs from "fs/promises";
 import path from "path";
-import {processApiRequest} from "./index";
+import {getS3ToolsInfo, processApiRequest} from "./index";
 import type {APIGatewayProxyStructuredResultV2} from "aws-lambda";
 
 const app = express();
@@ -95,6 +95,17 @@ app.get("/welcome", (_req, res) => {
 
 app.get("/tools", (_req, res) => {
   res.status(200).type("html").send(TOOLS_HTML);
+});
+
+app.get("/s3-files", async (req, res) => {
+  try {
+    const prefix = String(req.query.prefix || "").trim();
+    const limit = parseInt(String(req.query.limit || "100"), 10);
+    const info = await getS3ToolsInfo(prefix || undefined, Number.isFinite(limit) ? limit : 100);
+    res.status(200).json({success: true, ...info});
+  } catch (error: any) {
+    res.status(400).json({success: false, error: error?.message || "Failed to list S3 files"});
+  }
 });
 
 app.get("/files", async (req, res) => {
@@ -398,6 +409,29 @@ const TOOLS_HTML = `<!doctype html>
     </div>
 
     <div class="card">
+      <h2>S3 Bucket Browser</h2>
+      <div class="grid">
+        <div>
+          <label for="s3PrefixInput">S3 Prefix</label>
+          <input id="s3PrefixInput" type="text" placeholder="example: music" />
+          <label for="s3LimitInput">Max Files</label>
+          <input id="s3LimitInput" type="text" value="100" />
+          <button id="s3RefreshBtn">Refresh S3 Files</button>
+          <div id="s3InfoOut" class="out"></div>
+        </div>
+        <div>
+          <table>
+            <thead>
+              <tr><th>Key</th><th>Size</th><th>Modified</th></tr>
+            </thead>
+            <tbody id="s3Rows"></tbody>
+          </table>
+          <div id="s3Out" class="out"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
       <h2>Create Or Upload</h2>
       <div class="grid">
         <div>
@@ -447,6 +481,56 @@ const TOOLS_HTML = `<!doctype html>
     function showMessage(message, isError = false) {
       const out = document.getElementById('fileOut');
       out.innerHTML = isError ? '<div class="error">' + message + '</div>' : message;
+    }
+
+    async function listS3Files() {
+      const prefixInput = document.getElementById('s3PrefixInput');
+      const limitInput = document.getElementById('s3LimitInput');
+      const infoOut = document.getElementById('s3InfoOut');
+      const out = document.getElementById('s3Out');
+      const rows = document.getElementById('s3Rows');
+      const prefix = prefixInput.value.trim();
+      const limit = limitInput.value.trim() || '100';
+      rows.innerHTML = '';
+      out.textContent = 'Loading S3 files...';
+
+      try {
+        const query = '?prefix=' + encodeURIComponent(prefix) + '&limit=' + encodeURIComponent(limit);
+        const res = await fetch(getApiBase() + '/s3-files' + query);
+        const data = await res.json();
+        if (!res.ok || !data.success) {
+          infoOut.innerHTML = '<div class="error">' + (data.error || 'Failed to list S3 files') + '</div>';
+          out.innerHTML = '';
+          return;
+        }
+
+        const bucketInfo =
+          'Bucket: <b>' + String(data.bucket || '(missing S3_BUCKET)') + '</b><br>' +
+          'Region: <b>' + String(data.region || '') + '</b><br>' +
+          'MUSIC_PREFIX: <b>' + String(data.musicPrefix || '') + '</b><br>' +
+          'S3_PREFIX: <b>' + String(data.s3Prefix || '') + '</b><br>' +
+          'Used Prefix: <b>' + String(data.effectivePrefix || '(root)') + '</b>';
+        infoOut.innerHTML = bucketInfo;
+
+        for (const item of data.files || []) {
+          const tr = document.createElement('tr');
+          const keyCell = document.createElement('td');
+          keyCell.textContent = String(item.key || '');
+          const sizeCell = document.createElement('td');
+          sizeCell.textContent = String(item.size || 0);
+          const modCell = document.createElement('td');
+          modCell.textContent = String(item.lastModified || '');
+          tr.appendChild(keyCell);
+          tr.appendChild(sizeCell);
+          tr.appendChild(modCell);
+          rows.appendChild(tr);
+        }
+
+        out.textContent = 'Listed ' + String(data.totalReturned || 0) + ' S3 files.';
+      } catch (err) {
+        infoOut.innerHTML = '<div class="error">Failed to list S3 files: ' + (err.message || String(err)) + '</div>';
+        out.textContent = '';
+      }
     }
 
     async function listFiles(pathValue) {
@@ -678,6 +762,7 @@ const TOOLS_HTML = `<!doctype html>
     });
     document.getElementById('assetsBtn').addEventListener('click', () => listFiles('assets'));
     document.getElementById('musicBtn').addEventListener('click', () => listFiles('music'));
+    document.getElementById('s3RefreshBtn').addEventListener('click', listS3Files);
 
     document.getElementById('mkdirBtn').addEventListener('click', async () => {
       const folderPath = document.getElementById('newFolderPath').value.trim();
@@ -759,6 +844,7 @@ const TOOLS_HTML = `<!doctype html>
     }
 
     listFiles('.');
+    listS3Files();
   </script>
 </body>
 </html>`;

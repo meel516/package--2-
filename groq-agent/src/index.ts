@@ -99,6 +99,60 @@ export async function processApiRequest(
   }
 }
 
+export async function getS3ToolsInfo(prefixOverride?: string, maxKeys = 100): Promise<{
+  bucket: string | undefined;
+  region: string;
+  s3Prefix: string;
+  musicPrefix: string;
+  effectivePrefix: string;
+  maxKeys: number;
+  totalReturned: number;
+  files: Array<{key: string; size: number; lastModified: string | null}>;
+}> {
+  const effectivePrefix = normalizePrefix(prefixOverride || musicPrefix || "");
+  const safeMaxKeys = Math.min(Math.max(1, maxKeys), 500);
+
+  if (!bucket) {
+    return {
+      bucket,
+      region: process.env.AWS_REGION || "us-east-1",
+      s3Prefix,
+      musicPrefix,
+      effectivePrefix,
+      maxKeys: safeMaxKeys,
+      totalReturned: 0,
+      files: [],
+    };
+  }
+
+  const listed = await s3.send(
+    new ListObjectsV2Command({
+      Bucket: bucket,
+      Prefix: effectivePrefix ? `${effectivePrefix}/` : undefined,
+      MaxKeys: safeMaxKeys,
+    })
+  );
+
+  const files = (listed.Contents || [])
+    .filter((item): item is {Key: string; Size?: number; LastModified?: Date} => !!item.Key)
+    .map((item) => ({
+      key: item.Key,
+      size: Number(item.Size || 0),
+      lastModified: item.LastModified ? item.LastModified.toISOString() : null,
+    }));
+
+  return {
+    bucket,
+    region: process.env.AWS_REGION || "us-east-1",
+    s3Prefix,
+    musicPrefix,
+    effectivePrefix,
+    maxKeys: safeMaxKeys,
+    totalReturned: files.length,
+    files,
+  };
+}
+
 
 export const handler = async (
   event: APIGatewayProxyEventV2
