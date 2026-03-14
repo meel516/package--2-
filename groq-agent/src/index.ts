@@ -34,6 +34,9 @@ const allowedOrigin = process.env.ALLOWED_ORIGIN || "*";
 const bgRemovalEngine = "@imgly/background-removal-node";
 const bgRemovalModelSize = (process.env.BG_REMOVAL_MODEL_SIZE || "small").toLowerCase();
 const rmbgModelId = "briaai/RMBG-1.4";
+const defringeWhitenessFactor = clamp01(
+  parseFloat(process.env.DEFRINGE_WHITENESS_FACTOR || "0.85")
+);
 let rmbgSegmenterPromise: Promise<any> | null = null;
 const heavyJobConcurrency = Math.max(
   1,
@@ -759,7 +762,8 @@ async function removeBackgroundFromImage(inputBuffer: Buffer, mimeType: string):
   const errors: string[] = [];
   let blob: Blob | null = null;
   const normalizedMimeType = normalizeImageMimeType(mimeType);
-  const sourceBlob = new Blob([new Uint8Array(inputBuffer)], {type: normalizedMimeType});
+  const preprocessed = await preprocessInputToPngWithAlpha(inputBuffer, normalizedMimeType);
+  const sourceBlob = new Blob([new Uint8Array(preprocessed)], {type: "image/png"});
 
   for (const model of modelCandidates) {
     try {
@@ -781,14 +785,16 @@ async function removeBackgroundFromImage(inputBuffer: Buffer, mimeType: string):
     throw new Error(`Background removal failed. ${errors.join(" | ")}`);
   }
 
-  return Buffer.from(await blob.arrayBuffer());
+  const outputBuffer = Buffer.from(await blob.arrayBuffer());
+  return defringeWhiteEdges(outputBuffer, defringeWhitenessFactor);
 }
 
 async function removeBackgroundWithRmbg(inputBuffer: Buffer): Promise<Buffer> {
   const tempInput = path.join(os.tmpdir(), `rmbg-input-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.png`);
 
   try {
-    fs.writeFileSync(tempInput, inputBuffer);
+    const preprocessed = await preprocessInputToPngWithAlpha(inputBuffer, "image/png");
+    fs.writeFileSync(tempInput, preprocessed);
     const segmenter = await getRmbgSegmenter();
     const segments = await segmenter(tempInput, {threshold: 0.5, mask_threshold: 0.5});
 
@@ -822,7 +828,7 @@ async function removeBackgroundWithRmbg(inputBuffer: Buffer): Promise<Buffer> {
       rgba[i * 4 + 3] = alpha[i];
     }
 
-    return sharp(rgba, {
+    const outputBuffer = await sharp(rgba, {
       raw: {
         width: info.width,
         height: info.height,
@@ -831,9 +837,74 @@ async function removeBackgroundWithRmbg(inputBuffer: Buffer): Promise<Buffer> {
     })
       .png()
       .toBuffer();
+
+    return defringeWhiteEdges(outputBuffer, defringeWhitenessFactor);
   } finally {
     safeDelete(tempInput);
   }
+}
+
+async function preprocessInputToPngWithAlpha(inputBuffer: Buffer, mimeType: string): Promise<Buffer> {
+  if (mimeType === "image/png") {
+    return sharp(inputBuffer).ensureAlpha().png().toBuffer();
+  }
+
+  return sharp(inputBuffer)
+    .ensureAlpha()
+    .png()
+    .toBuffer();
+}
+
+async function defringeWhiteEdges(inputBuffer: Buffer, whitenessFactor: number): Promise<Buffer> {
+  if (whitenessFactor <= 0) {
+    return inputBuffer;
+  }
+
+  const {data: rgba, info} = await sharp(inputBuffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({resolveWithObject: true});
+
+  const width = info.width;
+  const height = info.height;
+  const total = width * height;
+
+  for (let i = 0; i < total; i++) {
+    const idx = i * 4;
+    const a = rgba[idx + 3];
+    if (a <= 0 || a >= 255) {
+      continue;
+    }
+
+    const r = rgba[idx];
+    const g = rgba[idx + 1];
+    const b = rgba[idx + 2];
+    const whiteness = Math.min(r, g, b) / 255;
+
+    if (whiteness < whitenessFactor) {
+      continue;
+    }
+
+    const alpha = a / 255;
+    const invAlpha = 1 / alpha;
+    const newR = clamp255((r - 255 * (1 - alpha)) * invAlpha);
+    const newG = clamp255((g - 255 * (1 - alpha)) * invAlpha);
+    const newB = clamp255((b - 255 * (1 - alpha)) * invAlpha);
+
+    rgba[idx] = newR;
+    rgba[idx + 1] = newG;
+    rgba[idx + 2] = newB;
+  }
+
+  return sharp(rgba, {
+    raw: {
+      width,
+      height,
+      channels: 4,
+    },
+  })
+    .png()
+    .toBuffer();
 }
 
 async function getRmbgSegmenter(): Promise<any> {
@@ -909,6 +980,16 @@ function normalizeImageMimeType(mimeType: string): string {
   }
 
   return "application/octet-stream";
+}
+
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(1, Math.max(0, value));
+}
+
+function clamp255(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(255, Math.max(0, Math.round(value)));
 }
 
 function buildS3Key(mimeType: string): string {
