@@ -423,6 +423,15 @@ async function handleRemoveBackgroundAsset(payload: any): Promise<APIGatewayProx
     });
   }
 
+  if (imageAssets.length === 0 && singleImage) {
+    return response(200, {
+      success: true,
+      output: outputs[0],
+      model: rmbgModelId,
+      engine: "@huggingface/transformers",
+    });
+  }
+
   return response(200, {
     success: true,
     count: outputs.length,
