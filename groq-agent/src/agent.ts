@@ -6,6 +6,7 @@ const client = new OpenAI({
   baseURL: "https://api.groq.com/openai/v1",
 });
 
+
 // Define tools/functions the agent can use
 const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
