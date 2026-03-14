@@ -384,16 +384,22 @@ async function handleRemoveBackgroundAsset(payload: any): Promise<APIGatewayProx
   const imageAssets = extractAssets(source).filter((asset) =>
     String(asset.mimeType || "").toLowerCase().startsWith("image/")
   );
+  const singleImage = imageAssets.length === 0 ? extractImagePayload(source) : null;
 
-  if (imageAssets.length === 0) {
+  if (imageAssets.length === 0 && !singleImage) {
     return response(400, {
-      error: "No image assets found. Provide assets[] or Gemini payload with image inlineData.",
+      error:
+        "No image assets found. Provide assets[]/Gemini inlineData or imageBase64/image/base64Data/data.",
     });
   }
 
   const outputs: Array<{key: string; signedUrl: string; mimeType: string}> = [];
-  for (const asset of imageAssets) {
-    const inputBuffer = Buffer.from(asset.data, "base64");
+  const assetsToProcess =
+    imageAssets.length > 0
+      ? imageAssets.map((asset) => Buffer.from(asset.data, "base64"))
+      : [imagePayloadToBuffer(singleImage!)];
+
+  for (const inputBuffer of assetsToProcess) {
     const outputBuffer = await removeBackgroundWithRmbg(inputBuffer);
     const key = `${s3Prefix}/images/${Date.now()}-${crypto.randomBytes(4).toString("hex")}-rmbg.png`;
 

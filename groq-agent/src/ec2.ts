@@ -63,8 +63,18 @@ app.post("/remove-bg", upload.any(), async (req, res) => {
   sendResult(res, result);
 });
 
-app.post("/remove-bg-asset", async (req, res) => {
-  const result = await processApiRequest("POST", "/remove-bg-asset", req.body || {});
+app.post("/remove-bg-asset", upload.any(), async (req, res) => {
+  const payload: Record<string, unknown> = {
+    ...(req.body || {}),
+  };
+
+  const file = firstUploadedFile(req);
+  if (file?.buffer?.length) {
+    payload.imageBuffer = file.buffer;
+    payload.mimeType = file.mimetype || "image/png";
+  }
+
+  const result = await processApiRequest("POST", "/remove-bg-asset", payload);
   sendResult(res, result);
 });
 
