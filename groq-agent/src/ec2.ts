@@ -1,13 +1,20 @@
 import express from "express";
 import multer from "multer";
 import fs from "fs/promises";
+import os from "os";
 import path from "path";
 import {getS3ToolsInfo, processApiRequest} from "./index";
 import type {APIGatewayProxyStructuredResultV2} from "aws-lambda";
 
 const app = express();
 const port = parseInt(process.env.PORT || "3003", 10);
-const upload = multer({storage: multer.memoryStorage()});
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, os.tmpdir()),
+    filename: (_req, file, cb) =>
+      cb(null, `${Date.now()}-${Math.random().toString(16).slice(2)}-${file.originalname}`),
+  }),
+});
 const fileRoot = path.resolve(process.env.FILE_MANAGER_ROOT || process.cwd());
 const assetsDirName = "assets";
 const musicDirName = "music";
@@ -39,9 +46,13 @@ app.post("/upload-image", upload.any(), async (req, res) => {
   };
 
   const file = firstUploadedFile(req);
-  if (file?.buffer?.length) {
-    payload.imageBuffer = file.buffer;
-    payload.mimeType = file.mimetype || "image/png";
+  if (file?.path) {
+    try {
+      payload.imageBuffer = await fs.readFile(file.path);
+      payload.mimeType = file.mimetype || "image/png";
+    } finally {
+      void safeUnlink(file.path);
+    }
   }
 
   const result = await processApiRequest("POST", "/upload-image", payload);
@@ -54,9 +65,13 @@ app.post("/remove-bg", upload.any(), async (req, res) => {
   };
 
   const file = firstUploadedFile(req);
-  if (file?.buffer?.length) {
-    payload.imageBuffer = file.buffer;
-    payload.mimeType = file.mimetype || "image/png";
+  if (file?.path) {
+    try {
+      payload.imageBuffer = await fs.readFile(file.path);
+      payload.mimeType = file.mimetype || "image/png";
+    } finally {
+      void safeUnlink(file.path);
+    }
   }
 
   const result = await processApiRequest("POST", "/remove-bg", payload);
@@ -69,9 +84,13 @@ app.post("/remove-bg-asset", upload.any(), async (req, res) => {
   };
 
   const file = firstUploadedFile(req);
-  if (file?.buffer?.length) {
-    payload.imageBuffer = file.buffer;
-    payload.mimeType = file.mimetype || "image/png";
+  if (file?.path) {
+    try {
+      payload.imageBuffer = await fs.readFile(file.path);
+      payload.mimeType = file.mimetype || "image/png";
+    } finally {
+      void safeUnlink(file.path);
+    }
   }
 
   const result = await processApiRequest("POST", "/remove-bg-asset", payload);
@@ -88,8 +107,12 @@ app.post("/add-music", upload.single("video"), async (req, res) => {
     ...(req.body || {}),
   };
 
-  if (req.file?.buffer?.length) {
-    payload.videoBuffer = req.file.buffer;
+  if (req.file?.path) {
+    try {
+      payload.videoBuffer = await fs.readFile(req.file.path);
+    } finally {
+      void safeUnlink(req.file.path);
+    }
     if (!payload.outputMode) {
       payload.outputMode = "file";
     }
@@ -301,6 +324,14 @@ function firstUploadedFile(req: express.Request): Express.Multer.File | null {
   }
 
   return null;
+}
+
+async function safeUnlink(filePath: string): Promise<void> {
+  try {
+    await fs.unlink(filePath);
+  } catch {
+    // ignore
+  }
 }
 
 function resolveSafePath(relativePath: string): string {
