@@ -67,6 +67,11 @@ export async function processApiRequest(
     return response(200, {ok: true});
   }
 
+  if (rawPath === "/warmup" || route === "GET /warmup") {
+    getRmbgSegmenter().catch(() => {});
+    return response(200, {ok: true, warmed: true});
+  }
+
   try {
     if (route === "POST /upload-asset") {
       return await handleUploadAsset(payload);
