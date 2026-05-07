@@ -1,0 +1,145 @@
+name: CI/CD Lambda
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "groq-agent/**"
+      - ".github/workflows/cicd-lambda.yml"
+
+jobs:
+  deploy-lambda:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Lambda image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          ECR_REPOSITORY: groq-agent
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          aws ecr describe-repositories --repository-names "${ECR_REPOSITORY}" >/dev/null 2>&1 || \
+            aws ecr create-repository --repository-name "${ECR_REPOSITORY}" >/dev/null
+
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker build -f groq-agent/Dockerfile -t "${IMAGE_URI}" groq-agent
+          docker push "${IMAGE_URI}"
+          echo "IMAGE_URI=${IMAGE_URI}" >> "${GITHUB_ENV}"
+
+      - name: Create or update Lambda function
+        env:
+          LAMBDA_FUNCTION_NAME: groq-agent
+          LAMBDA_ROLE_ARN: arn:aws:iam::965590945341:role/lambda-execution-role
+        run: |
+          set -euo pipefail
+          if aws lambda get-function --function-name "${LAMBDA_FUNCTION_NAME}" >/dev/null 2>&1; then
+            echo "Updating existing Lambda function..."
+            aws lambda update-function-code \
+              --function-name "${LAMBDA_FUNCTION_NAME}" \
+              --image-uri "${IMAGE_URI}"
+            aws lambda wait function-updated --function-name "${LAMBDA_FUNCTION_NAME}"
+          else
+            echo "Creating new Lambda function..."
+            aws lambda create-function \
+              --function-name "${LAMBDA_FUNCTION_NAME}" \
+              --package-type Image \
+              --code ImageUri="${IMAGE_URI}" \
+              --role "${LAMBDA_ROLE_ARN}" \
+              --timeout 120 \
+              --memory-size 2048 \
+              --description "Background removal and asset processing API"
+            aws lambda wait function-active --function-name "${LAMBDA_FUNCTION_NAME}"
+          fi
+
+      - name: Create or update API Gateway
+        env:
+          LAMBDA_FUNCTION_NAME: groq-agent
+        run: |
+          set -euo pipefail
+          API_NAME="groq-agent-api"
+
+          # Get Lambda ARN
+          LAMBDA_ARN=$(aws lambda get-function --function-name "${LAMBDA_FUNCTION_NAME}" --query 'Configuration.FunctionArn' --output text)
+          ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+          REGION="${AWS_REGION}"
+
+          # Check if API already exists
+          API_ID=$(aws apigatewayv2 get-apis --query "Items[?Name=='${API_NAME}'].ApiId" --output text 2>/dev/null || true)
+
+          if [ -z "${API_ID}" ] || [ "${API_ID}" = "None" ]; then
+            echo "Creating HTTP API Gateway..."
+            API_ID=$(aws apigatewayv2 create-api \
+              --name "${API_NAME}" \
+              --protocol-type HTTP \
+              --target "${LAMBDA_ARN}" \
+              --query 'ApiId' \
+              --output text)
+          fi
+
+          echo "API Gateway ID: ${API_ID}"
+          API_ENDPOINT="https://${API_ID}.execute-api.${REGION}.amazonaws.com"
+
+          # Add Lambda permission for API Gateway
+          STATEMENT_ID="apigw-invoke-${API_ID}"
+          aws lambda remove-permission \
+            --function-name "${LAMBDA_FUNCTION_NAME}" \
+            --statement-id "${STATEMENT_ID}" 2>/dev/null || true
+          aws lambda add-permission \
+            --function-name "${LAMBDA_FUNCTION_NAME}" \
+            --statement-id "${STATEMENT_ID}" \
+            --action lambda:InvokeFunction \
+            --principal apigateway.amazonaws.com \
+            --source-arn "arn:aws:execute-api:${REGION}:${ACCOUNT_ID}:${API_ID}/*/*/*" >/dev/null
+
+          # Update API target to latest Lambda ARN
+          DEFAULT_ROUTE_ID=$(aws apigatewayv2 get-routes --api-id "${API_ID}" --query "Items[?RouteKey=='\$default'].RouteId" --output text 2>/dev/null || true)
+          if [ -n "${DEFAULT_ROUTE_ID}" ] && [ "${DEFAULT_ROUTE_ID}" != "None" ]; then
+            aws apigatewayv2 update-route \
+              --api-id "${API_ID}" \
+              --route-id "${DEFAULT_ROUTE_ID}" \
+              --target "integrations/${API_ID}" >/dev/null 2>&1 || true
+          fi
+
+          # Create integration if needed
+          INTEGRATION_ID=$(aws apigatewayv2 get-integrations --api-id "${API_ID}" --query 'Items[0].IntegrationId' --output text 2>/dev/null || true)
+          if [ -z "${INTEGRATION_ID}" ] || [ "${INTEGRATION_ID}" = "None" ]; then
+            aws apigatewayv2 create-integration \
+              --api-id "${API_ID}" \
+              --integration-type AWS_PROXY \
+              --integration-uri "${LAMBDA_ARN}" \
+              --payload-format-version "2.0" >/dev/null
+          fi
+
+          # Create stage
+          aws apigatewayv2 get-stage --api-id "${API_ID}" --stage-name "\$default" >/dev/null 2>&1 || \
+            aws apigatewayv2 create-stage --api-id "${API_ID}" --stage-name "\$default" --auto-deploy >/dev/null
+
+          # Ensure auto-deploy is enabled
+          aws apigatewayv2 update-stage \
+            --api-id "${API_ID}" \
+            --stage-name "\$default" \
+            --auto-deploy >/dev/null 2>&1 || true
+
+          echo "========================================"
+          echo "Lambda deployment complete!"
+          echo "API URL: ${API_ENDPOINT}"
+          echo "========================================"

@@ -160,7 +160,7 @@ export async function getS3ToolsInfo(prefixOverride?: string, maxKeys = 100): Pr
 export const handler = async (
   event: APIGatewayProxyEventV2
 ): Promise<APIGatewayProxyStructuredResultV2> => {
-  const body = parseJsonBody(event);
+  const body = parseRequestBody(event);
   return processApiRequest(event.requestContext.http.method, event.rawPath, body);
 };
 
@@ -468,16 +468,146 @@ async function handleTesting(payload: any): Promise<APIGatewayProxyStructuredRes
   });
 }
 
-function parseJsonBody(event: APIGatewayProxyEventV2): any {
+function parseRequestBody(event: APIGatewayProxyEventV2): any {
   if (!event.body) {
     return {};
   }
 
-  const rawBody = event.isBase64Encoded
-    ? Buffer.from(event.body, "base64").toString("utf-8")
-    : event.body;
+  const contentType = getHeader(event.headers, "content-type").toLowerCase();
+  const rawBuffer = event.isBase64Encoded
+    ? Buffer.from(event.body, "base64")
+    : Buffer.from(event.body, "utf-8");
+
+  if (contentType.includes("multipart/form-data")) {
+    return parseMultipartBody(rawBuffer, contentType);
+  }
+
+  if (contentType.includes("application/x-www-form-urlencoded")) {
+    return Object.fromEntries(new URLSearchParams(rawBuffer.toString("utf-8")));
+  }
+
+  const rawBody = rawBuffer.toString("utf-8");
+  if (!rawBody.trim()) {
+    return {};
+  }
 
   return JSON.parse(rawBody);
+}
+
+function getHeader(headers: APIGatewayProxyEventV2["headers"] | undefined, name: string): string {
+  const lowerName = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (key.toLowerCase() === lowerName) {
+      return String(value || "");
+    }
+  }
+  return "";
+}
+
+function parseMultipartBody(body: Buffer, contentType: string): Record<string, unknown> {
+  const boundaryMatch = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
+  const boundary = boundaryMatch?.[1] || boundaryMatch?.[2];
+  if (!boundary) {
+    throw new Error("Missing multipart boundary");
+  }
+
+  const payload: Record<string, unknown> = {};
+  const delimiter = Buffer.from(`--${boundary}`);
+  let cursor = body.indexOf(delimiter);
+
+  while (cursor !== -1) {
+    let partStart = cursor + delimiter.length;
+    if (body.slice(partStart, partStart + 2).toString("utf-8") === "--") {
+      break;
+    }
+    if (body.slice(partStart, partStart + 2).toString("utf-8") === "\r\n") {
+      partStart += 2;
+    }
+
+    const next = body.indexOf(delimiter, partStart);
+    if (next === -1) {
+      break;
+    }
+
+    let part = body.slice(partStart, next);
+    if (part.slice(-2).toString("utf-8") === "\r\n") {
+      part = part.slice(0, -2);
+    }
+
+    addMultipartPartToPayload(payload, part);
+    cursor = next;
+  }
+
+  return payload;
+}
+
+function addMultipartPartToPayload(payload: Record<string, unknown>, part: Buffer): void {
+  const headerEnd = part.indexOf(Buffer.from("\r\n\r\n"));
+  if (headerEnd === -1) {
+    return;
+  }
+
+  const rawHeaders = part.slice(0, headerEnd).toString("utf-8");
+  const content = part.slice(headerEnd + 4);
+  const headers = parseMultipartHeaders(rawHeaders);
+  const disposition = headers["content-disposition"] || "";
+  const name = disposition.match(/name="([^"]+)"/i)?.[1];
+  const filename = disposition.match(/filename="([^"]*)"/i)?.[1];
+  if (!name) {
+    return;
+  }
+
+  const mimeType = headers["content-type"] || "application/octet-stream";
+  if (filename) {
+    if (mimeType.toLowerCase().startsWith("image/")) {
+      payload.imageBuffer = content;
+      payload.mimeType = mimeType;
+      return;
+    }
+
+    if (mimeType.toLowerCase().startsWith("video/") || name === "video") {
+      payload.videoBuffer = content;
+      payload.mimeType = mimeType;
+      return;
+    }
+
+    payload[`${name}Buffer`] = content;
+    payload[`${name}MimeType`] = mimeType;
+    return;
+  }
+
+  payload[name] = parseMaybeJsonField(content.toString("utf-8"));
+}
+
+function parseMultipartHeaders(rawHeaders: string): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const line of rawHeaders.split("\r\n")) {
+    const separator = line.indexOf(":");
+    if (separator === -1) {
+      continue;
+    }
+    const key = line.slice(0, separator).trim().toLowerCase();
+    const value = line.slice(separator + 1).trim();
+    headers[key] = value;
+  }
+  return headers;
+}
+
+function parseMaybeJsonField(value: string): unknown {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return value;
+  }
+
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+    return value;
+  }
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return value;
+  }
 }
 
 function extractAssets(payload: any): UploadAsset[] {
