@@ -25,7 +25,7 @@ const ffprobeInstaller = require("@ffprobe-installer/ffprobe");
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 ffmpeg.setFfprobePath(ffprobeInstaller.path);
 
-const s3 = new S3Client({region: process.env.AWS_REGION || "us-east-1"});
+const s3 = new S3Client({region: process.env.S3_BUCKET_REGION || process.env.AWS_REGION || "us-east-1"});
 const bucket = process.env.S3_BUCKET;
 const s3Prefix = normalizePrefix(process.env.S3_PREFIX || "ai-generated-assets");
 const musicPrefix = normalizePrefix(process.env.MUSIC_PREFIX || "music");
