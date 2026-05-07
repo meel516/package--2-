@@ -1057,6 +1057,7 @@ async function getRmbgSegmenter(): Promise<any> {
     rmbgSegmenterPromise = (async () => {
       const transformers = await import("@huggingface/transformers");
       transformers.env.allowLocalModels = false;
+      transformers.env.cacheDir = "/tmp/hf-cache";
       return transformers.pipeline("image-segmentation", rmbgModelId);
     })();
   }
