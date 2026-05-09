@@ -68,6 +68,7 @@ export async function processApiRequest(
   }
 
   if (rawPath === "/warmup" || route === "GET /warmup") {
+    cleanTmpDir();
     getRmbgSegmenter().catch(() => {});
     return response(200, {ok: true, warmed: true});
   }
@@ -1189,6 +1190,30 @@ function safeDelete(filePath: string): void {
     }
   } catch (error) {
     console.warn(`Failed to delete temp file ${filePath}`, error);
+  }
+}
+
+function cleanTmpDir(): void {
+  try {
+    const tmpDir = os.tmpdir();
+    const now = Date.now();
+    const maxAgeMs = 30 * 60 * 1000;
+    for (const entry of fs.readdirSync(tmpDir)) {
+      if (!entry.startsWith("rmbg-input-") && !entry.startsWith("input-") && !entry.startsWith("output-") && !entry.startsWith("music-") && !entry.startsWith("raw-input-")) {
+        continue;
+      }
+      const filePath = path.join(tmpDir, entry);
+      try {
+        const stat = fs.statSync(filePath);
+        if (now - stat.mtimeMs > maxAgeMs) {
+          fs.unlinkSync(filePath);
+        }
+      } catch {
+        // skip files that disappear between readdir and stat
+      }
+    }
+  } catch {
+    // non-critical, ignore
   }
 }
 
